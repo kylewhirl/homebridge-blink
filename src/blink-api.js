@@ -6,24 +6,26 @@ const {sleep} = require('./utils');
 const IniFile = require('./inifile');
 const {log} = require('./log');
 const {stringify} = require('./stringify');
+const {OAuthClient} = require('./oauth');
 // const stringify = JSON.stringify;
 // crypto.randomBytes(16).toString("hex").toUpperCase().replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, "$1-$2-$3-$4-$5")
 const DEFAULT_BLINK_CLIENT_UUID = '1EAF7C88-2AAB-BC51-038D-DB96D6EEE22F';
 const BLINK_API_HOST = 'immedia-semi.com';
 const CACHE = new Map();
-const BLINK_APP_BUILD = 'ANDROID_28373244';
-const BLINK_USER_AGENT = '27.0ANDROID_28373244';
-const BLINK_APP_VERSION = '27.0 (28373244)';
+const BLINK_APP_BUILD = process.env.BLINK_APP_BUILD || 'IOS_2509241604';
+const BLINK_USER_AGENT = process.env.BLINK_UA || 'Blink/2509241604 CFNetwork/3826.600.41 Darwin/24.6.0';
+const BLINK_APP_VERSION = process.env.BLINK_APP_VERSION || '6.24.0 (2509241604)';
+const DEFAULT_TIME_ZONE = process.env.BLINK_TZ || 'America/Los_Angeles';
 
 const DEFAULT_CLIENT_OPTIONS = {
     notificationKey: null,
-    device: 'Blinkpy',
-    type: 'android',
-    name: 'Computer',
+    device: 'iPhone15,3',
+    type: 'ios',
+    name: 'Homebridge',
     appVersion: BLINK_APP_VERSION,
     appBuild: BLINK_APP_BUILD,
     userAgent: BLINK_USER_AGENT,
-    os: '14',
+    os: '17.5',
 };
 
 /* eslint-disable */
@@ -176,16 +178,117 @@ const DEFAULT_CLIENT_OPTIONS = {
 
 class BlinkAPI {
     constructor(clientUUID, auth = {path: '~/.blink', section: 'default'}) {
-        const ini = IniFile.read(process.env.BLINK || auth.path, process.env.BLINK_SECTION || auth.section);
-        this.auth = Object.assign({
-            email: process.env.BLINK_EMAIL || ini.email,
-            password: process.env.BLINK_PASSWORD || ini.password,
-            pin: process.env.BLINK_PIN || ini.pin,
-            clientUUID: clientUUID || process.env.BLINK_CLIENT_UUID || ini.client || DEFAULT_BLINK_CLIENT_UUID,
-            notificationKey: process.env.BLINK_NOTIFICATION_KEY || ini.notification ||
-                crypto.randomBytes(32).toString('hex'),
-        }, auth);
-        this.clientOptions = Object.assign({}, DEFAULT_CLIENT_OPTIONS);
+        auth = auth || {};
+        const authPath = process.env.BLINK || auth.path;
+        const authSection = process.env.BLINK_SECTION || auth.section;
+        const ini = IniFile.read(authPath, authSection);
+
+        const parseJSON = value => {
+            if (!value) return {};
+            if (typeof value === 'object') return value;
+            try {
+                return JSON.parse(value);
+            }
+            catch (err) {
+                log.debug(`Failed to parse JSON config: ${err.message}`);
+                return {};
+            }
+        };
+        const lookupIni = (...keys) => {
+            if (!ini) return undefined;
+            for (const key of keys) {
+                if (!key) continue;
+                if (ini[key] !== undefined) return ini[key];
+                const normalized = key.replace(/\./g, '_');
+                if (ini[normalized] !== undefined) return ini[normalized];
+            }
+            return undefined;
+        };
+        const parseBool = value => {
+            if (typeof value === 'boolean') return value;
+            if (typeof value === 'string') {
+                if (/^(true|yes|1)$/i.test(value)) return true;
+                if (/^(false|no|0)$/i.test(value)) return false;
+            }
+            return undefined;
+        };
+
+        const iniOAuth = parseJSON(lookupIni('oauth'));
+        const iniAppIdentity = parseJSON(lookupIni('appIdentity'));
+
+        const authConfig = auth.credentials || auth;
+
+        this.authPath = authPath;
+        this.authSection = authSection;
+        this.auth = {
+            email: process.env.BLINK_EMAIL ?? authConfig.email ?? lookupIni('email'),
+            password: process.env.BLINK_PASSWORD ?? authConfig.password ?? lookupIni('password'),
+            pin: process.env.BLINK_PIN ?? authConfig.pin ?? lookupIni('pin'),
+            clientUUID: clientUUID || process.env.BLINK_CLIENT_UUID || authConfig.clientUUID ||
+                lookupIni('client') || DEFAULT_BLINK_CLIENT_UUID,
+            notificationKey: process.env.BLINK_NOTIFICATION_KEY ?? authConfig.notificationKey ??
+                lookupIni('notification') ?? crypto.randomBytes(32).toString('hex'),
+        };
+
+        this.clientOptions = Object.assign({}, DEFAULT_CLIENT_OPTIONS, auth.clientOptions || {});
+        this.clientOptions.notificationKey = this.auth.notificationKey;
+
+        this.appIdentity = Object.assign({
+            appBuild: iniAppIdentity.appBuild || this.clientOptions.appBuild || BLINK_APP_BUILD,
+            userAgent: iniAppIdentity.userAgent || this.clientOptions.userAgent || BLINK_USER_AGENT,
+            timeZone: iniAppIdentity.timeZone || DEFAULT_TIME_ZONE,
+        }, auth.appIdentity || {});
+
+        this.clientOptions.appBuild = this.appIdentity.appBuild;
+        this.clientOptions.userAgent = this.appIdentity.userAgent;
+
+        this.preferOAuth = parseBool(auth.preferOAuth);
+        if (this.preferOAuth === undefined) this.preferOAuth = parseBool(lookupIni('preferOAuth'));
+        if (this.preferOAuth === undefined) this.preferOAuth = true;
+
+        this.enableLegacyLogin = parseBool(auth.enableLegacyLogin);
+        if (this.enableLegacyLogin === undefined) this.enableLegacyLogin = parseBool(lookupIni('enableLegacyLogin'));
+        if (this.enableLegacyLogin === undefined) this.enableLegacyLogin = true;
+
+        const refreshToken = process.env.BLINK_REFRESH_TOKEN ??
+            (auth.oauth && auth.oauth.refreshToken) ??
+            lookupIni('oauth.refreshToken', 'oauth_refreshToken', 'refresh_token') ??
+            iniOAuth.refreshToken;
+
+        const accessToken = auth.accessToken ?? lookupIni('access_token') ?? iniOAuth.accessToken;
+        const expiresAt = Number(auth.accessTokenExpiresAt ??
+            lookupIni('access_token_expires_at') ?? iniOAuth.accessTokenExpiresAt) || 0;
+
+        this.tokenStore = {
+            accessToken: accessToken || null,
+            accessTokenExpiresAt: expiresAt,
+            refreshToken: refreshToken || null,
+        };
+
+        const oauthClientId = (auth.oauth && auth.oauth.clientId) || iniOAuth.clientId || 'ios';
+        const oauthScope = (auth.oauth && auth.oauth.scope) || iniOAuth.scope || 'client';
+
+        this.oauth = new OAuthClient({
+            fetch,
+            appBuild: this.appIdentity.appBuild,
+            userAgent: this.appIdentity.userAgent,
+            timeZone: this.appIdentity.timeZone,
+            clientId: oauthClientId,
+            scope: oauthScope,
+            tokenStore: this.tokenStore,
+        });
+
+        const storedRegion = auth.region || lookupIni('region', 'tier');
+        this.region = storedRegion || 'prod';
+
+        this.authMode = (this.preferOAuth && this.tokenStore.refreshToken) ? 'oauth' : 'legacy';
+        if (this.authMode === 'oauth') {
+            this.token = null;
+        }
+        this._legacyNoticeLogged = false;
+        this._lastLegacyLoginResponse = null;
+        this._forceLegacyLogin = false;
+        this._legacyLoginHttpErrorAsError = undefined;
     }
 
     set region(val) {
@@ -197,7 +300,7 @@ class BlinkAPI {
     }
 
     set token(val) {
-        if (val) this._token = val;
+        this._token = val || null;
     }
 
     get token() {
@@ -220,6 +323,18 @@ class BlinkAPI {
         return this._clientID;
     }
 
+    set authMode(val) {
+        if (!val) return;
+        this._authMode = val;
+        if (val === 'oauth') {
+            this._token = null;
+        }
+    }
+
+    get authMode() {
+        return this._authMode || 'legacy';
+    }
+
     init(token, accountID, clientID, region = 'prod') {
         this.token = token;
         this.accountID = accountID;
@@ -239,10 +354,10 @@ class BlinkAPI {
         return this._request('POST', path, body, null, autologin, httpErrorAsError);
     }
 
-    async _request(method = 'GET', path = '/', body = null, maxTTL = null, autologin = true, httpErrorAsError = true) {
-        // first invocation we refresh the API tokens
-        if (autologin) await this.login();
-        const targetPath = path.replace('{accountID}', this.accountID).replace('{clientID}', this.clientID);
+    async _request(method = 'GET', path = '/', body = null, maxTTL = null, autologin = true,
+        httpErrorAsError = true, retrying = false) {
+        if (autologin) await this.ensureSession();
+        const targetPath = this._expandPath(path);
 
         if (CACHE.has(method + targetPath) && maxTTL > 0) {
             const cache = CACHE.get(method + targetPath);
@@ -250,117 +365,417 @@ class BlinkAPI {
             if (lastModified + (maxTTL * 1000) > Date.now()) {
                 return cache._body;
             }
-            else {
-                // to avoid pile-ons, let's use stale cache for 10s
-                // TODO: make this work for cache misses too?
-                cache.headers.set('last-modified', (new Date(Date.now() + 3 * 1000)).toISOString());
-            }
+            cache.headers.set('last-modified', (new Date(Date.now() + 3 * 1000)).toISOString());
         }
 
-        const client = this.clientOptions || DEFAULT_CLIENT_OPTIONS;
-        const headers = {
-            'User-Agent': client.userAgent || BLINK_USER_AGENT,
-            'APP-BUILD': client.appBuild || BLINK_APP_BUILD,
-            'Locale': 'en_US',
-            'x-blink-time-zone': 'America/New York',
-            'accept-language': 'en_US',
-            'Accept': '*/*',
-        };
-        if (this.token) headers['TOKEN_AUTH'] = this.token;
-
+        const headers = this._buildRequestHeaders(body);
         const options = {method, headers};
-        if (body) {
-            options.body = JSON.stringify(body);
-            options.headers['Content-Type'] = 'application/json';
+        if (body !== null && body !== undefined) {
+            options.body = typeof body === 'string' ? body : JSON.stringify(body);
         }
 
         log.info(`${method} ${targetPath} @${maxTTL}`);
         log.debug(options);
-        const urlPrefix = targetPath.startsWith('http') ?
-            '' :
-            `https://rest-${this.region || 'prod'}.${BLINK_API_HOST}`;
-        const res = await fetch(`${urlPrefix}${targetPath}`, options).catch(async e => {
-            if (!/ECONNRESET|ETIMEDOUT|ESOCKETTIMEDOUT|disconnected/.test(e.message)) log.error(e);
-            // TODO: handle network errors more gracefully
-            if (autologin) return null;
-            return Promise.reject(e);
-        });
-        if (!res || res === {}) {
-            await this.login(true); // force a login on network connection loss
-            return await this._request(method, path, body, maxTTL, false);
+        const urlPrefix = this._resolveUrl(targetPath);
+        let res;
+        try {
+            res = await fetch(`${urlPrefix}${targetPath}`, options);
         }
-        log.debug(res.status + ' ' + res.statusText);
-        log.debug(Object.fromEntries(res.headers.entries()));
-        // TODO: deal with network failures
-
-        if (/application\/json/.test(res.headers.get('content-type'))) {
-            const json = await res.json();
-            res._body = json; // stash it for the cache because .json() isn't re-callable
-            log.debug(stringify(json));
-        }
-        else if (/text/.test(res.headers.get('content-type'))) {
-            const txt = await res.text();
-            res._body = txt; // stash it for the cache because .json() isn't re-callable
-            log.debug(txt);
-        }
-        else {
-            // TODO: what happens if the buffer isn't fully consumed?
-            res._body = Buffer.from(await res.arrayBuffer());
-        }
-        if (res.status === 401) {
-            // if the API call resulted in 401 Unauthorized (token expired?), try logging in again.
+        catch (e) {
+            if (!/ECONNRESET|ETIMEDOUT|ESOCKETTIMEDOUT|disconnected/i.test(e.message)) log.error(e);
             if (autologin) {
-                await this.login(true);
-                return this._request(method, path, body, maxTTL, false, httpErrorAsError);
+                await sleep(500);
+                return this._request(method, path, body, maxTTL, false, httpErrorAsError, retrying);
             }
-            // fallback
-            // TODO: handle error states more gracefully
-            log.error(`${method} ${targetPath} (${res.headers.get('status') || res.status + ' ' + res.statusText})`);
-            log.error(res?._body ?? Object.fromEntries(res.headers));
-            if (httpErrorAsError) {
-                throw new Error(res.headers.get('status'));
+            throw e;
+        }
+
+        if (!res) {
+            if (autologin) {
+                await sleep(500);
+                return this._request(method, path, body, maxTTL, false, httpErrorAsError, retrying);
+            }
+            throw new Error('Blink API request failed with no response');
+        }
+
+        log.debug(res.status + ' ' + res.statusText);
+        if (res.headers?.entries) {
+            try {
+                log.debug(Object.fromEntries(res.headers.entries()));
+            }
+            catch (_) {
+                // ignore header logging failures
             }
         }
-        else if (res.status >= 500) {
-            // TODO: how do we get out of infinite retry?
-            log.error(`RETRY: ${method} ${targetPath} (${res.headers.get('status') || res.status + ' ' + res.statusText})`);
-            this.token = null; // force a re-login if 5xx errors
-            await sleep(1000);
-            return this._request(method, path, body, maxTTL, false, httpErrorAsError);
+
+        await this._captureBody(res);
+
+        if (res.status === 401) {
+            if (this.authMode === 'oauth' && !retrying) {
+                await this._refreshAccessToken();
+                return this._request(method, path, body, maxTTL, false, httpErrorAsError, true);
+            }
+            if (this.authMode === 'legacy' && autologin && !retrying) {
+                this.token = null;
+                await this.ensureSession();
+                return this._request(method, path, body, maxTTL, false, httpErrorAsError, true);
+            }
+            return this._handleHttpError(res, method, targetPath, httpErrorAsError);
         }
-        else if (res.status === 429) {
-            // TODO: how do we get out of infinite retry?
-            log.error(`RETRY: ${method} ${targetPath} (${res.headers.get('status') || res.status + ' ' + res.statusText})`);
-            await sleep(500);
-            return this._request(method, path, body, maxTTL, false, httpErrorAsError);
+
+        if (res.status === 426) {
+            return this._handleHttpError(res, method, targetPath, true);
         }
-        else if (res.status === 409) {
+
+        if (res.status >= 500) {
+            const statusLabel = this._statusLabel(res);
+            log.error(`RETRY: ${method} ${targetPath} (${statusLabel})`);
+            if (this.authMode === 'legacy') this.token = null;
+            if (!retrying) {
+                await sleep(1000);
+                return this._request(method, path, body, maxTTL, false, httpErrorAsError, true);
+            }
+            return this._handleHttpError(res, method, targetPath, httpErrorAsError);
+        }
+
+        if (res.status === 429) {
+            const statusLabel = this._statusLabel(res);
+            log.error(`RETRY: ${method} ${targetPath} (${statusLabel})`);
+            if (!retrying) {
+                await sleep(500);
+                return this._request(method, path, body, maxTTL, false, httpErrorAsError, true);
+            }
+            return this._handleHttpError(res, method, targetPath, httpErrorAsError);
+        }
+
+        if (res.status === 409) {
             if (httpErrorAsError) {
-                if (!/busy/.test(res?._body?.message)) {
-                    const status = res.headers.get('status') || res.status + ' ' + res.statusText;
-                    throw new Error(`${method} ${targetPath} (${status})`);
+                if (!/busy/i.test(res?._body?.message)) {
+                    return this._handleHttpError(res, method, targetPath, httpErrorAsError);
                 }
             }
         }
         else if (res.status >= 400) {
-            const status = res.headers.get('status') || res.status + ' ' + res.statusText;
-            log.error(`${method} ${targetPath} (${status})`);
-            log.error(res?._body ?? Object.fromEntries(res.headers));
-            if (httpErrorAsError) {
-                throw new Error(`${method} ${targetPath} (${status})`);
-            }
+            return this._handleHttpError(res, method, targetPath, httpErrorAsError);
         }
-        // TODO: what about other 3xx?
-        else if (res.status === 200) {
-            if (method === 'GET') {
-                CACHE.set(method + targetPath, res);
-            }
+
+        if (method === 'GET') {
+            CACHE.set(method + targetPath, res);
         }
 
         if (method !== 'GET') {
             CACHE.delete('GET' + path);
         }
         return res._body;
+    }
+
+    async ensureSession() {
+        if (this.authMode === 'oauth') {
+            if (!this.tokenStore.refreshToken) {
+                if (this.preferOAuth && !this._legacyNoticeLogged) {
+                    log.info('Blink legacy login in use; add an OAuth refresh token to enable OAuth authentication.');
+                    this._legacyNoticeLogged = true;
+                }
+                if (this.enableLegacyLogin) {
+                    this.authMode = 'legacy';
+                    return this.ensureSession();
+                }
+                throw new Error('No OAuth refresh token configured and legacy login disabled.');
+            }
+            const expiresAt = Number(this.tokenStore.accessTokenExpiresAt) || 0;
+            const expiresSoon = !this.tokenStore.accessToken || Date.now() > (expiresAt - 60000);
+            if (expiresSoon) {
+                await this._refreshAccessToken();
+            }
+            this.token = null;
+            this._forceLegacyLogin = false;
+            this._legacyLoginHttpErrorAsError = undefined;
+            return;
+        }
+
+        if (!this.enableLegacyLogin) {
+            throw new Error('Legacy login disabled.');
+        }
+
+        if (this.preferOAuth && !this.tokenStore.refreshToken && !this._legacyNoticeLogged) {
+            log.info('Blink legacy login in use; add an OAuth refresh token to enable OAuth authentication.');
+            this._legacyNoticeLogged = true;
+        }
+
+        const httpErrorAsError = this._legacyLoginHttpErrorAsError ?? true;
+        const forceLogin = this._forceLegacyLogin || !this.token;
+        if (forceLogin) {
+            try {
+                await this.loginLegacy(forceLogin, this.clientOptions, httpErrorAsError);
+            }
+            finally {
+                this._forceLegacyLogin = false;
+                this._legacyLoginHttpErrorAsError = undefined;
+            }
+        }
+        else {
+            this._forceLegacyLogin = false;
+            this._legacyLoginHttpErrorAsError = undefined;
+        }
+    }
+
+    async login(force = false, client = DEFAULT_CLIENT_OPTIONS, httpErrorAsError = true) {
+        if (client) {
+            this.clientOptions = Object.assign({}, DEFAULT_CLIENT_OPTIONS, client || {});
+            this.clientOptions.notificationKey = this.auth.notificationKey;
+        }
+
+        if (this.authMode === 'legacy') {
+            this._legacyLoginHttpErrorAsError = httpErrorAsError;
+            this._forceLegacyLogin = force;
+            await this.ensureSession();
+            return this._lastLegacyLoginResponse;
+        }
+
+        if (!this.tokenStore.refreshToken && this.enableLegacyLogin) {
+            this._legacyLoginHttpErrorAsError = httpErrorAsError;
+            this._forceLegacyLogin = force;
+        }
+
+        if (force) {
+            this.tokenStore.accessToken = null;
+            this.tokenStore.accessTokenExpiresAt = 0;
+        }
+
+        await this.ensureSession();
+
+        if (this.authMode === 'legacy') {
+            return this._lastLegacyLoginResponse;
+        }
+
+        return {
+            auth: {token: this.tokenStore.accessToken},
+            account: {
+                account_id: this.accountID,
+                client_id: this.clientID,
+                tier: this.region,
+            },
+        };
+    }
+
+    async loginLegacy(force = false, client = this.clientOptions, httpErrorAsError = true) {
+        if (!this.enableLegacyLogin) {
+            throw new Error('Legacy login is disabled.');
+        }
+        if (!force && this.token) return this._lastLegacyLoginResponse;
+        if (!this.auth?.email || !this.auth?.password) {
+            throw new Error('Email or Password is blank');
+        }
+
+        const clientOptions = Object.assign({}, DEFAULT_CLIENT_OPTIONS, client || {});
+        clientOptions.notificationKey = clientOptions.notificationKey || this.auth.notificationKey;
+        clientOptions.appBuild = clientOptions.appBuild || this.appIdentity.appBuild;
+        clientOptions.userAgent = clientOptions.userAgent || this.appIdentity.userAgent;
+        clientOptions.appVersion = clientOptions.appVersion || BLINK_APP_VERSION;
+        clientOptions.os = clientOptions.os || '17.5';
+        this.clientOptions = clientOptions;
+
+        const data = {
+            'app_version': clientOptions.appVersion,
+            'client_name': clientOptions.name,
+            'client_type': clientOptions.type,
+            'device_identifier': clientOptions.device,
+            'email': this.auth.email,
+            'notification_key': clientOptions.notificationKey,
+            'os_version': clientOptions.os,
+            'password': this.auth.password,
+            'unique_id': this.auth.clientUUID,
+            'app_build': clientOptions.appBuild,
+        };
+        if (this.auth.pin) data.reauth = 'true';
+
+        const headers = this._buildBaseHeaders();
+        headers['Content-Type'] = 'application/json';
+        const url = `https://rest-${this.region || 'prod'}.${BLINK_API_HOST}/api/v5/account/login`;
+        const res = await fetch(url, {method: 'POST', headers, body: JSON.stringify(data)});
+
+        await this._captureBody(res);
+
+        if (res.status === 426) {
+            const details = this._stringifyBody(res._body);
+            throw new Error(`Legacy login rejected with 426 Upgrade Required${details ? `: ${details}` : ''}`);
+        }
+        if (!res.ok) {
+            return this._handleHttpError(res, 'POST', '/api/v5/account/login', httpErrorAsError);
+        }
+
+        const account = res._body?.account || {};
+        this.init(res._body?.auth?.token, account.account_id || account.id, account.client_id, account.tier || this.region);
+        this.authMode = 'legacy';
+        this._lastLegacyLoginResponse = res._body;
+        await this._maybeDiscoverRegion();
+        this._persistTokens();
+        return res._body;
+    }
+
+    async _maybeDiscoverRegion() {
+        const endpoints = ['/api/v6/homescreen', '/api/v6/accounts/me/homescreen'];
+        for (const endpoint of endpoints) {
+            try {
+                const result = await this._request('GET', endpoint, null, 0, false, false, true);
+                if (result) {
+                    this._applyRegionMetadata(result);
+                    this._persistTokens();
+                    return;
+                }
+            }
+            catch (err) {
+                if (err?.status && err.status !== 404) {
+                    log.debug(`Region discovery failed via ${endpoint}: ${err.message}`);
+                }
+            }
+        }
+    }
+
+    _applyRegionMetadata(payload) {
+        if (!payload) return;
+        const account = payload.account || payload.accounts?.[0];
+        if (account) {
+            const accountId = account.account_id || account.id;
+            const clientId = account.client_id || account.clientID;
+            if (accountId) this.accountID = accountId;
+            if (clientId) this.clientID = clientId;
+            if (account.tier) this.region = account.tier;
+        }
+
+        const regionInfo = payload.region || {};
+        if (regionInfo.tier) this.region = regionInfo.tier;
+        if (regionInfo.id) this.region = regionInfo.id;
+        const restUrl = regionInfo.rest || regionInfo.dns || payload.rest_url || payload.rest_url_v6;
+        const match = restUrl && /rest-([a-z0-9]+)/i.exec(restUrl);
+        if (match && match[1]) this.region = match[1];
+    }
+
+    _persistTokens() {
+        if (typeof IniFile.write !== 'function' || !this.authPath || !this.authSection) return;
+        const data = {region: this.region};
+        if (this.tokenStore.refreshToken) data.refresh_token = this.tokenStore.refreshToken;
+        if (this.authMode === 'oauth') {
+            if (this.tokenStore.accessToken) data.access_token = this.tokenStore.accessToken;
+            if (this.tokenStore.accessTokenExpiresAt) {
+                data.access_token_expires_at = this.tokenStore.accessTokenExpiresAt;
+            }
+        }
+        try {
+            IniFile.write(this.authPath, this.authSection, data);
+        }
+        catch (err) {
+            log.debug(`Failed to persist tokens: ${err.message}`);
+        }
+    }
+
+    _buildBaseHeaders() {
+        return {
+            'APP-BUILD': this.appIdentity.appBuild || BLINK_APP_BUILD,
+            'User-Agent': this.appIdentity.userAgent || BLINK_USER_AGENT,
+            'X-Blink-Time-Zone': this.appIdentity.timeZone || DEFAULT_TIME_ZONE,
+            'Accept': '*/*',
+            'Accept-Language': 'en_US',
+            'Locale': 'en_US',
+            'Cache-Control': 'no-cache',
+        };
+    }
+
+    _buildRequestHeaders(body) {
+        const headers = this._buildBaseHeaders();
+        if (body !== null && body !== undefined) {
+            headers['Content-Type'] = 'application/json';
+        }
+        if (this.authMode === 'oauth' && this.tokenStore.accessToken) {
+            headers['Authorization'] = `Bearer ${this.tokenStore.accessToken}`;
+        }
+        else if (this.token) {
+            headers['TOKEN_AUTH'] = this.token;
+        }
+        return headers;
+    }
+
+    _resolveUrl(targetPath) {
+        return /^https?:/i.test(targetPath) ? '' : `https://rest-${this.region || 'prod'}.${BLINK_API_HOST}`;
+    }
+
+    _expandPath(path = '/') {
+        let targetPath = path;
+        if (this.accountID) targetPath = targetPath.replace('{accountID}', this.accountID);
+        if (this.clientID) targetPath = targetPath.replace('{clientID}', this.clientID);
+        return targetPath;
+    }
+
+    async _captureBody(res) {
+        if (!res) return null;
+        const contentType = res.headers?.get ? res.headers.get('content-type') || '' : '';
+        if (/application\/json/i.test(contentType)) {
+            const json = await res.json();
+            res._body = json;
+            log.debug(stringify(json));
+            return json;
+        }
+        if (/text\//i.test(contentType)) {
+            const text = await res.text();
+            res._body = text;
+            log.debug(text);
+            return text;
+        }
+        if (typeof res.arrayBuffer === 'function') {
+            const buffer = Buffer.from(await res.arrayBuffer());
+            res._body = buffer;
+            return buffer;
+        }
+        res._body = null;
+        return null;
+    }
+
+    _statusLabel(res) {
+        if (!res) return '';
+        const header = res.headers && typeof res.headers.get === 'function' ? res.headers.get('status') : null;
+        const statusText = `${res.status || ''} ${res.statusText || ''}`.trim();
+        return header || statusText;
+    }
+
+    _handleHttpError(res, method, targetPath, httpErrorAsError) {
+        const statusLabel = this._statusLabel(res);
+        const body = res?._body;
+        if (res?.status === 426) {
+            const details = this._stringifyBody(body);
+            const err = new Error(`Legacy login rejected with 426 Upgrade Required${details ? `: ${details}` : ''}`);
+            err.status = res.status;
+            throw err;
+        }
+        log.error(`${method} ${targetPath} (${statusLabel})`);
+        if (body) log.error(body);
+        if (!httpErrorAsError) return body;
+        const error = new Error(`${method} ${targetPath} (${statusLabel})`);
+        error.status = res?.status;
+        error.response = body;
+        throw error;
+    }
+
+    _stringifyBody(body) {
+        if (!body) return '';
+        if (typeof body === 'string') return body;
+        try {
+            return stringify(body);
+        }
+        catch (err) {
+            try {
+                return JSON.stringify(body);
+            }
+            catch (_) {
+                return '';
+            }
+        }
+    }
+
+    async _refreshAccessToken() {
+        await this.oauth.refreshWithRefreshToken();
+        this.authMode = 'oauth';
+        this._persistTokens();
+        await this._maybeDiscoverRegion();
     }
 
     async getUrl(url) {
@@ -372,115 +787,6 @@ class BlinkAPI {
      * APP CLIENT FUNCTIONS
      *
      **/
-
-    /**
-     *
-     * POST https://rest-prod.immedia-semi.com/api/v5/account/login
-     *
-     * :authority:       rest-prod.immedia-semi.com
-     * locale:           en_CA
-     * content-type:     application/json
-     * accept:           * /*
-     * app-build:        ANDROID_28373244
-     * accept-encoding:  gzip, deflate, br
-     * user-agent:       27.0ANDROID_28373244
-     * accept-language:  en-CA
-     * content-length:   337
-     *
-     * {
-     *     "app_version": "6.1.1 (8854) #e06341d7f",
-     *     "client_name": "iPhone",
-     *     "client_type": "ios",
-     *     "device_identifier": "iPhone12,3",
-     *     "email": "user@example.com",
-     *     "notification_key": "4976d0584130d0122a31887952f778aab5164461fe43db067159dc11da2cb535",
-     *     "os_version": "14.2",
-     *     "password": "password1",
-     *     "unique_id": "6D684F3D-1D86-14F9-B748-15571A3F1FFF"
-     * }
-     *
-     * content-type:            application/json
-     * date:                    Fri, 02 Oct 2020 00:26:27 GMT
-     * vary:                    Accept-Encoding
-     * status:                  200 OK
-     * x-blink-served-by:       i-022a33c1836242ee4
-     * x-content-type-options:  nosniff
-     * x-powered-by:            Phusion Passenger
-     * server:                  nginx + Phusion Passenger
-     * content-encoding:        gzip
-     * x-cache:                 Miss from cloudfront
-     * via:                     1.1 2c060d2b820e53bf308fe03fbfaed0e9.cloudfront.net (CloudFront)
-     * x-amz-cf-pop:            ATL56-C1
-     * x-amz-cf-id:             9gCCfKQ9_aGv53o0Gt75aNVRs0bxiWtkQ_FC-kWYJYLEeihFtm9BAw==
-     *
-     * {
-     *     "account": {
-     *        "account_id": 1000001,
-     *        "account_verification_required": false,
-     *        "client_id": 2360401,
-     *        "client_verification_required": true,
-     *        "new_account": false,
-     *        "phone_verification_required": false,
-     *        "region": "ap",
-     *        "tier": "prod",
-     *        "user_id": 12147,
-     *        "verification_channel": "phone"
-     *    },
-     *    "allow_pin_resend_seconds": 60,
-     *    "auth": {
-     *        "token": "2YKEsy9BPb9puha1s4uBwe"
-     *    },
-     *    "force_password_reset": false,
-     *    "lockout_time_remaining": 0,
-     *    "phone": {
-     *        "country_calling_code": "1",
-     *        "last_4_digits": "5555",
-     *        "number": "+1******5555",
-     *        "valid": true
-     *    },
-     *    "verification": {
-     *        "email": {
-     *            "required": false
-     *        },
-     *        "phone": {
-     *            "channel": "sms",
-     *            "required": true
-     *        }
-     *    }
-     * }
-     *
-     **/
-
-    async login(force = false, client = DEFAULT_CLIENT_OPTIONS, httpErrorAsError = true) {
-        if (!force && this.token) return;
-        if (!this.auth?.email || !this.auth?.password) throw new Error('Email or Password is blank');
-
-        client = Object.assign({}, DEFAULT_CLIENT_OPTIONS, client || {});
-        this.clientOptions = client;
-        const data = {
-            'app_version': client.appVersion,
-            'client_name': client.name,
-            'client_type': client.type,
-            'device_identifier': client.device,
-            'email': this.auth.email,
-            'notification_key': client.notificationKey || this.auth.notificationKey,
-            'os_version': client.os,
-            'password': this.auth.password,
-            'unique_id': this.auth.clientUUID,
-        };
-        if (client.appBuild) data.app_build = client.appBuild;
-        if (this.auth.pin) data.reauth = 'true';
-
-        const res = await this.post('/api/v5/account/login', data, false, httpErrorAsError);
-
-        if (/unauthorized|invalid/i.test(res?.message)) {
-            throw new Error(res.message);
-        }
-        else {
-            this.init(res.auth?.token, res.account?.account_id, res.account?.client_id, res.account?.tier);
-        }
-        return res;
-    }
 
     /**
      * POST https://rest-prod.immedia-semi.com/api/v4/account/1000001/client/2360401/pin/verify
@@ -1026,12 +1332,18 @@ class BlinkAPI {
      *      "target_id":4000001,"parent_command_id":null,"camera_id":4000001,"siren_id":null,"firmware_id":null,
      *      "network_id":2000001,"account_id":1000001,"sync_module_id":3000001}],"media_id":null}
      **/
-    async getCameraLiveViewV5(networkID, cameraID) {
+    async startLiveView({accountId, networkId, cameraId}) {
         const data = {
             'intent': 'liveview',
             'motion_event_start_time': '',
         };
-        return await this.post(`/api/v5/accounts/{accountID}/networks/${networkID}/cameras/${cameraID}/liveview`, data);
+        const targetAccount = accountId || this.accountID;
+        const path = `/api/v6/accounts/${targetAccount}/networks/${networkId}/cameras/${cameraId}/liveview/`;
+        return await this.post(path, data);
+    }
+
+    async getCameraLiveViewV5(networkID, cameraID) {
+        return await this.startLiveView({accountId: this.accountID, networkId: networkID, cameraId: cameraID});
     }
 
     /**

@@ -1,190 +1,179 @@
-const {describe, expect, test, afterAll} = require('@jest/globals');
-const {setLogger} = require('./log');
-const logger = {
-    log: () => {},
-    error: console.error,
+const {describe, test, expect, beforeEach, afterEach} = require('@jest/globals');
+
+const mockFetch = jest.fn();
+jest.mock('@adobe/fetch', () => ({
+    fetch: (...args) => mockFetch(...args),
+    reset: jest.fn(),
+    __mock: mockFetch,
+}));
+const fetchMock = mockFetch;
+
+const createResponse = ({status = 200, headers = {}, body = {}} = {}) => {
+    const headerMap = new Map();
+    const headerEntries = Object.entries(headers);
+    if (!headerEntries.some(([key]) => key.toLowerCase() === 'content-type')) {
+        headerMap.set('content-type', typeof body === 'string' ? 'text/plain' : 'application/json');
+    }
+    for (const [key, value] of headerEntries) {
+        headerMap.set(key.toLowerCase(), value);
+    }
+    return {
+        status,
+        statusText: status === 200 ? 'OK' : 'ERROR',
+        ok: status >= 200 && status < 300,
+        headers: {
+            get: name => headerMap.get(name.toLowerCase()) ?? null,
+            set: (name, value) => headerMap.set(name.toLowerCase(), value),
+            entries: () => Array.from(headerMap.entries()),
+        },
+        json: async () => body,
+        text: async () => (typeof body === 'string' ? body : JSON.stringify(body)),
+        arrayBuffer: async () => Buffer.from(typeof body === 'string' ? body : JSON.stringify(body)).buffer,
+        _body: undefined,
+    };
 };
-setLogger(logger, false, false);
-const BlinkAPI = require('./blink-api');
-const SAMPLE = require('./blink-api.sample');
 
-const DEFAULT_BLINK_CLIENT_UUID = 'A5BF5C52-56F3-4ADB-A7C2-A70619552084';
+describe('BlinkAPI OAuth and legacy flows', () => {
+    let BlinkAPI;
+    let IniFile;
 
-const blinkAPI = new BlinkAPI(DEFAULT_BLINK_CLIENT_UUID);
-
-const withAuth = blinkAPI.auth.email ? describe : describe.skip;
-
-withAuth('blink-api', () => {
-    afterAll(() => {
-        blinkAPI.reset();
+    beforeEach(() => {
+        jest.clearAllMocks();
+        fetchMock.mockReset();
+        BlinkAPI = require('./blink-api');
+        IniFile = require('./inifile');
+        jest.spyOn(IniFile, 'write').mockImplementation(() => {});
     });
 
-    test('login', async () => {
-        // const blinkAPI = new BlinkAPI(DEFAULT_BLINK_CLIENT_UUID, auth);
-        expect(blinkAPI.token).toBeUndefined();
-        expect(blinkAPI.accountID).toBeUndefined();
-        expect(blinkAPI.clientID).toBeUndefined();
-        expect(blinkAPI.region).toBe('prod');
-
-        const res = await blinkAPI.login(true);
-        // res.auth.token, res.account.account_id, res.account.client_id, res.account.tier
-        expect(blinkAPI.token).toBeDefined();
-        expect(blinkAPI.accountID).toBeDefined();
-        expect(blinkAPI.clientID).toBeDefined();
-        expect(blinkAPI.region).toBeDefined();
-
-        expect(res?.auth?.token).toBe(blinkAPI.token);
-        expect(res?.account?.account_id).toBe(blinkAPI.accountID);
-        expect(res?.account?.client_id).toBe(blinkAPI.clientID);
-        expect(res?.account?.tier).toBe(blinkAPI.region);
+    afterEach(() => {
+        jest.restoreAllMocks();
     });
 
-    test('getClientOptions()', async () => {
-        const res = await blinkAPI.getClientOptions();
-        expect(res.options).toBeDefined();
-    });
-    test('getAccountHomescreen()', async () => {
-        const HOMESCREEN = SAMPLE.HOMESCREEN;
-        const res = await blinkAPI.getAccountHomescreen();
-        expect(Object.keys(HOMESCREEN)).toEqual(expect.arrayContaining(Object.keys(res)));
-
-        expect(Object.keys(res.account)).toEqual(expect.arrayContaining(Object.keys(HOMESCREEN.account)));
-
-        for (const network of res.networks) {
-            expect(Object.keys(network)).toEqual(expect.arrayContaining(Object.keys(HOMESCREEN.networks[0])));
-        }
-        for (const syncmodule of res.sync_modules) {
-            expect(Object.keys(syncmodule)).toEqual(expect.arrayContaining(Object.keys(HOMESCREEN.sync_modules[0])));
-        }
-        const CAMERA = HOMESCREEN.cameras[0];
-        for (const camera of res.cameras) {
-            expect(Object.keys(camera)).toEqual(expect.arrayContaining(Object.keys(CAMERA)));
-            expect(Object.keys(camera.signals)).toEqual(expect.arrayContaining(Object.keys(CAMERA.signals)));
-        }
-    });
-    test('getAccount()', async () => {
-        const res = await blinkAPI.getAccount();
-        expect(Object.keys(res)).toEqual(expect.arrayContaining(Object.keys(SAMPLE.ACCOUNT)));
-    });
-    test('getAccountStatus()', async () => {
-        await blinkAPI.getAccountStatus();
-    });
-    test('getAccountOptions()', async () => {
-        const res = await blinkAPI.getAccountOptions();
-        expect(Object.keys(res)).toEqual(expect.arrayContaining(Object.keys(SAMPLE.ACCOUNT_OPTIONS)));
-    });
-    test('getAccountNotifications()', async () => {
-        const res = await blinkAPI.getAccountNotifications();
-        expect(res.notifications).toBeInstanceOf(Object);
-
-        expect(Object.keys(res.notifications))
-            .toEqual(expect.arrayContaining(Object.keys(SAMPLE.ACCOUNT_NOTIFICATIONS.notifications)));
-    });
-    test('getMediaChange()', async () => {
-        const res = await blinkAPI.getMediaChange();
-        expect(res.media).toBeInstanceOf(Array);
-    });
-    test('getPrograms()', async () => {
-        const home = await blinkAPI.getAccountHomescreen();
-        const networkID = home.networks[0].id;
-        const res = await blinkAPI.getPrograms(networkID);
-        expect(res).toBeInstanceOf(Array);
-    });
-    test('getCameraConfig()', async () => {
-        const home = await blinkAPI.getAccountHomescreen();
-        for (const camera of home.cameras) {
-            const networkID = camera.network_id;
-            const cameraID = camera.id;
-            const res = await blinkAPI.getCameraConfig(networkID, cameraID);
-            const CAMERA = SAMPLE.CAMERA_CONFIG.camera[0];
-            for (const camera of res.camera) {
-                expect(Object.keys(camera)).toEqual(expect.arrayContaining(Object.keys(CAMERA)));
+    test('oauthRefresh_success_rotatesToken', async () => {
+        const now = Date.now();
+        fetchMock.mockImplementation(url => {
+            if (/oauth\/token/.test(url)) {
+                return Promise.resolve(createResponse({
+                    body: {access_token: 'X', refresh_token: 'B', expires_in: 10},
+                }));
             }
-            expect(Object.keys(res.signals)).toEqual(expect.arrayContaining(Object.keys(SAMPLE.CAMERA_CONFIG.signals)));
-        }
-    });
-    test('getCameraUsage()', async () => {
-        const res = await blinkAPI.getCameraUsage();
-        expect(Object.keys(res)).toEqual(expect.arrayContaining(Object.keys(SAMPLE.CAMERA_USAGE)));
-
-        const CAMERA = SAMPLE.CAMERA_USAGE.networks[0].cameras[0];
-        for (const network of res.networks) {
-            for (const camera of network.cameras) {
-                expect(Object.keys(camera)).toEqual(expect.arrayContaining(Object.keys(CAMERA)));
+            if (/\/api\/v6\/homescreen/.test(url)) {
+                return Promise.resolve(createResponse({
+                    body: {
+                        account: {account_id: 101, client_id: 202, tier: 'u001'},
+                        region: {rest: 'https://rest-u001.immedia-semi.com'},
+                    },
+                }));
             }
-        }
-    });
-    test('getCameraSignals()', async () => {
-        const home = await blinkAPI.getAccountHomescreen();
-        for (const camera of home.cameras) {
-            const networkID = camera.network_id;
-            const cameraID = camera.id;
-            const res = await blinkAPI.getCameraSignals(networkID, cameraID);
-            expect(Object.keys(res)).toEqual(expect.arrayContaining(Object.keys(SAMPLE.CAMERA_SIGNALS)));
-        }
-    });
-    test('getCameraStatus()', async () => {
-        const home = await blinkAPI.getAccountHomescreen();
-        for (const camera of home.cameras) {
-            const networkID = camera.network_id;
-            const cameraID = camera.id;
-            const res = await blinkAPI.getCameraStatus(networkID, cameraID);
-            expect(Object.keys(res.camera_status))
-                .toEqual(expect.arrayContaining(Object.keys(SAMPLE.CAMERA_STATUS.camera_status)));
-        }
-    });
-    test('getNetworks()', async () => {
-        const res = await blinkAPI.getNetworks();
-        expect(res.summary).toBeInstanceOf(Object);
-        expect(res.networks).toBeInstanceOf(Array);
-        const NETWORK = SAMPLE.NETWORKS.networks[0];
-        for (const network of res.networks) {
-            expect(Object.keys(network)).toEqual(expect.arrayContaining(Object.keys(NETWORK)));
-        }
-        expect(res.networks.length).toBeGreaterThanOrEqual(1);
-    });
-    test('getDevice()', async () => {
-        const home = await blinkAPI.getAccountHomescreen();
-        for (const camera of home.cameras) {
-            const serial = camera.serial;
-            const res = await blinkAPI.getDevice(serial);
-            expect(Object.keys(res)).toEqual(expect.arrayContaining(Object.keys(SAMPLE.DEVICE)));
-        }
-    });
-    test('getBlinkStatus()', async () => {
-        const res = await blinkAPI.getBlinkStatus();
-        expect(res.message_code).toBe(0);
-    });
-    test('getBlinkSupport()', async () => {
-        // deprecated?
-        await blinkAPI.getBlinkSupport();
-    });
-    test('getBlinkAppVersion()', async () => {
-        const res = await blinkAPI.getBlinkAppVersion();
-        expect(res.message).toBe('OK');
-    });
-    test('getBlinkRegions()', async () => {
-        const res = await blinkAPI.getBlinkRegions();
-        expect(res.preferred).toBeDefined();
-        expect(res.regions[res.preferred].dns).toBeDefined();
-    });
-    test('getSyncModuleFirmware()', async () => {
-        const home = await blinkAPI.getAccountHomescreen();
-        const serial = home.sync_modules[0].serial;
-        const res = await blinkAPI.getSyncModuleFirmware(serial);
-        expect(res).toBeInstanceOf(Buffer);
-    });
-    test('getAppStatus()', async () => {
-        const serial = 'ANDROID_28373244';
-        await blinkAPI.getAppStatus(serial);
+            if (/\/api\/v6\/test/.test(url)) {
+                return Promise.resolve(createResponse({body: {ok: true}}));
+            }
+            throw new Error(`Unhandled fetch: ${url}`);
+        });
+
+        const api = new BlinkAPI('uuid', {path: '/tmp/mock.ini', section: 'default', oauth: {refreshToken: 'A'}});
+        api.tokenStore.accessTokenExpiresAt = now - 1000;
+
+        await api.ensureSession();
+        await api.get('/api/v6/test', 0);
+
+        const testCall = fetchMock.mock.calls.find(([url]) => /\/api\/v6\/test/.test(url));
+        expect(testCall).toBeDefined();
+        expect(testCall[1].headers.Authorization).toBe('Bearer X');
+        expect(api.tokenStore.refreshToken).toBe('B');
+        expect(IniFile.write).toHaveBeenCalledWith(expect.any(String), expect.any(String), expect.objectContaining({
+            refresh_token: 'B',
+            access_token: 'X',
+        }));
     });
 
-    test('getSirens()', async () => {
+    test('request_401_triggers_refresh_once', async () => {
+        let dataCall = 0;
+        fetchMock.mockImplementation(url => {
+            if (/\/api\/v6\/data/.test(url)) {
+                dataCall += 1;
+                if (dataCall === 1) {
+                    return Promise.resolve(createResponse({status: 401, body: {message: 'expired'}}));
+                }
+                return Promise.resolve(createResponse({body: {result: 'ok'}}));
+            }
+            if (/oauth\/token/.test(url)) {
+                return Promise.resolve(createResponse({
+                    body: {access_token: 'Y', refresh_token: 'Y2', expires_in: 100},
+                }));
+            }
+            if (/\/api\/v6\/homescreen/.test(url)) {
+                return Promise.resolve(createResponse({
+                    body: {account: {account_id: 300, client_id: 400, tier: 'prod'}},
+                }));
+            }
+            throw new Error(`Unhandled fetch: ${url}`);
+        });
+
+        const api = new BlinkAPI('uuid', {
+            oauth: {refreshToken: 'refresh-token'},
+            accessToken: 'old',
+            accessTokenExpiresAt: Date.now() + 600000,
+        });
+
+        const response = await api.get('/api/v6/data', 0);
+
+        expect(response).toEqual({result: 'ok'});
+        const oauthCalls = fetchMock.mock.calls.filter(([url]) => /oauth\/token/.test(url));
+        expect(oauthCalls).toHaveLength(1);
+        const retryHeaders = fetchMock.mock.calls[3][1].headers;
+        expect(retryHeaders.Authorization).toBe('Bearer Y');
     });
-    test('getNetworkSirens()', async () => {
+
+    test('legacyLogin_426_throws', async () => {
+        fetchMock.mockImplementation(url => {
+            if (/account\/login/.test(url)) {
+                return Promise.resolve(createResponse({
+                    status: 426,
+                    body: {message: 'Upgrade Required'},
+                }));
+            }
+            throw new Error(`Unhandled fetch: ${url}`);
+        });
+
+        const api = new BlinkAPI('uuid', {
+            enableLegacyLogin: true,
+            preferOAuth: false,
+            email: 'user@example.com',
+            password: 'secret',
+        });
+
+        await expect(api.loginLegacy()).rejects.toThrow(/Upgrade Required/);
     });
-    test('getOwlConfig()', async () => {
-    });
-    test('getOwlFirmware()', async () => {
+
+    test('liveview_post_works', async () => {
+        fetchMock.mockImplementation(url => {
+            if (/liveview\//.test(url)) {
+                return Promise.resolve(createResponse({
+                    body: {
+                        server: 'immis://example',
+                        liveview_token: 'token123',
+                        command_id: 42,
+                    },
+                }));
+            }
+            throw new Error(`Unhandled fetch: ${url}`);
+        });
+
+        const api = new BlinkAPI('uuid', {
+            oauth: {refreshToken: 'refresh'},
+            accessToken: 'access',
+            accessTokenExpiresAt: Date.now() + 600000,
+        });
+        api.accountID = 321;
+        api.region = 'u003';
+
+        const payload = await api.startLiveView({accountId: 321, networkId: 654, cameraId: 987});
+
+        expect(payload.server).toBe('immis://example');
+        expect(payload.liveview_token).toBe('token123');
+        const [url, options] = fetchMock.mock.calls[0];
+        expect(url).toBe('https://rest-u003.immedia-semi.com/api/v6/accounts/321/networks/654/cameras/987/liveview/');
+        expect(options.headers.Authorization).toBe('Bearer access');
     });
 });

@@ -326,6 +326,12 @@ class Blink {
         this.motionPoll = motionPoll ?? MOTION_POLL;
         this.snapshotRate = snapshotRate ?? THUMBNAIL_TTL;
         this._lockCache = new Map();
+
+        const mode = this.blinkAPI.authMode === 'oauth' ? 'OAuth (refresh grant)' : 'legacy login';
+        log.info(`Blink service using ${mode}.`);
+        if (this.blinkAPI.authMode === 'legacy' && this.blinkAPI.preferOAuth && !this.blinkAPI.tokenStore.refreshToken) {
+            log.info('OAuth refresh token not configured; using legacy login until one is added.');
+        }
     }
 
     createNetwork(data) {
