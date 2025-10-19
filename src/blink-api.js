@@ -11,14 +11,19 @@ const {stringify} = require('./stringify');
 const DEFAULT_BLINK_CLIENT_UUID = '1EAF7C88-2AAB-BC51-038D-DB96D6EEE22F';
 const BLINK_API_HOST = 'immedia-semi.com';
 const CACHE = new Map();
+const BLINK_APP_BUILD = 'ANDROID_28373244';
+const BLINK_USER_AGENT = '27.0ANDROID_28373244';
+const BLINK_APP_VERSION = '27.0 (28373244)';
 
 const DEFAULT_CLIENT_OPTIONS = {
     notificationKey: null,
-    device: 'iPhone15,2',
-    type: 'ios',
-    name: 'iPhone',
-    appVersion: '6.18.0 (2210101952) #bd574f02a-mod',
-    os: '16.1',
+    device: 'Blinkpy',
+    type: 'android',
+    name: 'Computer',
+    appVersion: BLINK_APP_VERSION,
+    appBuild: BLINK_APP_BUILD,
+    userAgent: BLINK_USER_AGENT,
+    os: '14',
 };
 
 /* eslint-disable */
@@ -180,6 +185,7 @@ class BlinkAPI {
             notificationKey: process.env.BLINK_NOTIFICATION_KEY || ini.notification ||
                 crypto.randomBytes(32).toString('hex'),
         }, auth);
+        this.clientOptions = Object.assign({}, DEFAULT_CLIENT_OPTIONS);
     }
 
     set region(val) {
@@ -251,9 +257,10 @@ class BlinkAPI {
             }
         }
 
+        const client = this.clientOptions || DEFAULT_CLIENT_OPTIONS;
         const headers = {
-            'User-Agent': 'Blink/2210101952 CFNetwork/1399 Darwin/22.1.0',
-            'app-build': 'IOS_2210101952',
+            'User-Agent': client.userAgent || BLINK_USER_AGENT,
+            'APP-BUILD': client.appBuild || BLINK_APP_BUILD,
             'Locale': 'en_US',
             'x-blink-time-zone': 'America/New York',
             'accept-language': 'en_US',
@@ -374,9 +381,9 @@ class BlinkAPI {
      * locale:           en_CA
      * content-type:     application/json
      * accept:           * /*
-     * app-build:        IOS_8854
+     * app-build:        ANDROID_28373244
      * accept-encoding:  gzip, deflate, br
-     * user-agent:       Blink/8854 CFNetwork/1202 Darwin/20.1.0
+     * user-agent:       27.0ANDROID_28373244
      * accept-language:  en-CA
      * content-length:   337
      *
@@ -449,6 +456,7 @@ class BlinkAPI {
         if (!this.auth?.email || !this.auth?.password) throw new Error('Email or Password is blank');
 
         client = Object.assign({}, DEFAULT_CLIENT_OPTIONS, client || {});
+        this.clientOptions = client;
         const data = {
             'app_version': client.appVersion,
             'client_name': client.name,
@@ -460,6 +468,7 @@ class BlinkAPI {
             'password': this.auth.password,
             'unique_id': this.auth.clientUUID,
         };
+        if (client.appBuild) data.app_build = client.appBuild;
         if (this.auth.pin) data.reauth = 'true';
 
         const res = await this.post('/api/v5/account/login', data, false, httpErrorAsError);
@@ -479,10 +488,10 @@ class BlinkAPI {
      * locale:           en_CA
      * content-type:     application/json
      * accept:           * /*
-     * app-build:        IOS_8854
+     * app-build:        ANDROID_28373244
      * token-auth:       2YKEsy9BPb9puha1s4uBwe
      * accept-encoding:  gzip, deflate, br
-     * user-agent:       Blink/8854 CFNetwork/1202 Darwin/20.1.0
+     * user-agent:       27.0ANDROID_28373244
      * accept-language:  en-CA
      * content-length:   16
      * {"pin":"123456"}

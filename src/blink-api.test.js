@@ -175,7 +175,7 @@ withAuth('blink-api', () => {
         expect(res).toBeInstanceOf(Buffer);
     });
     test('getAppStatus()', async () => {
-        const serial = 'IOS_8854';
+        const serial = 'ANDROID_28373244';
         await blinkAPI.getAppStatus(serial);
     });
 
